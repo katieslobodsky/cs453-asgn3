@@ -1,4 +1,5 @@
 // dine.c: Dining Philosophers with pthreads + POSIX semaphores
+#define _POSIX_C_SOURCE 200809L   // for nanosleep()
 
 #include <errno.h>
 #include <limits.h>
