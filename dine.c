@@ -1,5 +1,8 @@
 // dine.c
 #define _POSIX_C_SOURCE 200809L
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#endif
 
 #include <errno.h>
 #include <limits.h>
@@ -11,6 +14,11 @@
 #include <semaphore.h>
 #include <time.h>
 #include <sys/time.h>
+
+#ifdef __APPLE__
+#include <fcntl.h>
+#include <sys/stat.h>
+#endif
 
 #ifndef NUM_PHILOSOPHERS
 #define NUM_PHILOSOPHERS 5
@@ -38,7 +46,6 @@ typedef struct {
 phil_arg_t;
 
 // global variables
-static sem_t forks[NUM_PHILOSOPHERS];
 static pthread_t tids[NUM_PHILOSOPHERS];
 static phil_arg_t args[NUM_PHILOSOPHERS];
 static pthread_mutex_t print_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -60,7 +67,11 @@ static void die_errno(const char *msg, int err) {
 static void dawdle(void) {
     // sleep for 0..DAWDLEFACTOR ms
     struct timespec tv;
+#ifdef __APPLE__
+    long ms = (long) (arc4random_uniform(DAWDLEFACTOR + 1));
+#else
     long ms = random() % (DAWDLEFACTOR + 1);
+#endif
     tv.tv_sec = ms / 1000;
     tv.tv_nsec = (ms % 1000) * 1000000L;
     if (nanosleep(&tv, NULL) == -1) {
@@ -108,6 +119,20 @@ static const char* state_suffix(state_t s) {
     }
 }
 
+// internal printer: caller must hold print_mtx
+static void print_status_locked(void) {
+    char fbuf[NUM_PHILOSOPHERS + 1];
+    printf("| ");
+    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
+        build_fork_str(i, fbuf, sizeof fbuf);
+        const char *suf = state_suffix(g_state[i]);
+        // show fork string + " Eat"/" Think", blank for changing
+        // align columns for neatness
+        printf("%-5s%-7s| ", fbuf, suf);
+    }
+    printf("\n");
+}
+
 // print header once at start
 static void print_header(void) {
     pthread_mutex_lock(&print_mtx);
@@ -126,32 +151,6 @@ static void print_header(void) {
         printf("=============|");
     }
     printf("\n");
-
-    // initial line: philosophers changing, holding nothing
-    char fbuf[NUM_PHILOSOPHERS + 1];
-    printf("| ");
-    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
-        build_fork_str(i, fbuf, sizeof fbuf);
-        printf("%-5s%-7s| ", fbuf, "");
-    }
-    printf("\n");
-    pthread_mutex_unlock(&print_mtx);
-}
-
-// print a single change line reflecting current global state
-static void print_status_one_change(void) {
-    pthread_mutex_lock(&print_mtx);
-
-    char fbuf[NUM_PHILOSOPHERS + 1];
-    printf("| ");
-    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
-        build_fork_str(i, fbuf, sizeof fbuf);
-        const char *suf = state_suffix(g_state[i]);
-        // show fork string + " Eat"/" Think", blank for changing
-        // align columns for neatness
-        printf("%-5s%-7s| ", fbuf, suf);
-    }
-    printf("\n");
     pthread_mutex_unlock(&print_mtx);
 }
 
@@ -167,15 +166,17 @@ static void pick_first_fork(int pid, int first_is_left) {
     }
 
     // wait
-    while (sem_wait(&forks[fork_idx]) == -1 && errno == EINTR) {}
+    fork_wait_idx(fork_idx);
 
+    // update + print atomically (one change per line)
+    pthread_mutex_lock(&print_mtx);
     if (first_is_left) {
         g_hold_left[pid] = 1;
     } else {
         g_hold_right[pid] = 1;
     }
-
-    print_status_one_change();
+    print_status_locked();
+    pthread_mutex_unlock(&print_mtx);
 }
 
 // picks up the philosopher's second fork
@@ -187,20 +188,22 @@ static void pick_second_fork(int pid, int first_is_left) {
         fork_idx = args[pid].left_fork;
     }
 
-    while (sem_wait(&forks[fork_idx]) == -1 && errno == EINTR) {}
+    fork_wait_idx(fork_idx);
 
+    pthread_mutex_lock(&print_mtx);
     if (first_is_left) {
         g_hold_right[pid] = 1;
     } else {
         g_hold_left[pid] = 1;
     }
-
-    print_status_one_change();
+    print_status_locked();
+    pthread_mutex_unlock(&print_mtx);
 }
 
 // releases one of the philosopher's forks
 static void put_down_one_fork(int pid, int left) {
     int fork_idx;
+    pthread_mutex_lock(&print_mtx);
     if (left) {
         fork_idx = args[pid].left_fork;
         g_hold_left[pid] = 0;
@@ -208,22 +211,16 @@ static void put_down_one_fork(int pid, int left) {
         fork_idx = args[pid].right_fork;
         g_hold_right[pid] = 0;
     }
+    print_status_locked();
+    pthread_mutex_unlock(&print_mtx);
 
     // post
-    if (sem_post(&forks[fork_idx]) == -1) {
-        perror("sem_post");
-        exit(1);
-    }
-    print_status_one_change();
+    fork_post_idx(fork_idx);
 }
 
 static void *philosopher(void *vp) {
     phil_arg_t *p = (phil_arg_t*)vp;
     int id = p->id;
-
-    // start hungry (changing) then attempt to eat first
-    g_state[id] = ST_CHANGING;
-    print_status_one_change();
 
     const int even = (id % 2 == 0);
 
@@ -232,28 +229,36 @@ static void *philosopher(void *vp) {
     // even -> right first; odd -> left first
     while (p->cycles > 0) {
         // ---- acquire forks (changing) ----
+        pthread_mutex_lock(&print_mtx);
         g_state[id] = ST_CHANGING;
-        print_status_one_change();
+        print_status_locked();
+        pthread_mutex_unlock(&print_mtx);
 
         pick_first_fork(id, !even);
         pick_second_fork(id, !even);
 
         // ---- eat ----
+        pthread_mutex_lock(&print_mtx);
         g_state[id] = ST_EATING;
-        print_status_one_change();
+        print_status_locked();
+        pthread_mutex_unlock(&print_mtx);
         dawdle();
 
         // ---- transition to set forks down ----
+        pthread_mutex_lock(&print_mtx);
         g_state[id] = ST_CHANGING;
-        print_status_one_change();
+        print_status_locked();
+        pthread_mutex_unlock(&print_mtx);
 
         // put down one at a time
         put_down_one_fork(id, !even);
-        put_down_one_fork(id, even);
+        put_down_one_fork(id,  even);
 
         // think
+        pthread_mutex_lock(&print_mtx);
         g_state[id] = ST_THINKING;
-        print_status_one_change();
+        print_status_locked();
+        pthread_mutex_unlock(&print_mtx);
         dawdle();
 
         // prepare next cycle
@@ -261,8 +266,10 @@ static void *philosopher(void *vp) {
     }
 
     // transition from thinking to terminated counts as changing
+    pthread_mutex_lock(&print_mtx);
     g_state[id] = ST_CHANGING;
-    print_status_one_change();
+    print_status_locked();
+    pthread_mutex_unlock(&print_mtx);
     return NULL;
 }
 
@@ -273,7 +280,9 @@ int main(int argc, char **argv) {
         perror("gettimeofday");
         return 1;
     }
+#ifndef __APPLE__
     srandom((unsigned)(tv.tv_sec ^ tv.tv_usec));
+#endif
 
     // parse optional cycles argument
     long cycles = 1;
@@ -296,12 +305,7 @@ int main(int argc, char **argv) {
     }
 
     // init semaphores (forks)
-    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
-        if (sem_init(&forks[i], 0, 1) == -1) {
-            perror("sem_init");
-            return 1;
-        }
-    }
+    forks_init_all();
 
     print_header();
 
@@ -329,12 +333,6 @@ int main(int argc, char **argv) {
     printf("\n");
     pthread_mutex_unlock(&print_mtx);
 
-    // destroy semaphores
-    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
-        if (sem_destroy(&forks[i]) == -1) {
-            perror("sem_destroy");
-        }
-    }
-
+    forks_destroy_all();
     return 0;
 }
