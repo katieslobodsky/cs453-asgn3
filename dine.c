@@ -37,7 +37,6 @@ typedef struct {
 }
 phil_arg_t;
 
-// ---- unnamed POSIX semaphores for forks (Linux/CSL) ----
 static sem_t forks_unnamed[NUM_PHILOSOPHERS];
 
 static void forks_init_all(void) {
