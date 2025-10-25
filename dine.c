@@ -1,8 +1,5 @@
 // dine.c
 #define _POSIX_C_SOURCE 200809L
-#ifdef __APPLE__
-#define _DARWIN_C_SOURCE
-#endif
 
 #include <errno.h>
 #include <limits.h>
@@ -14,11 +11,6 @@
 #include <semaphore.h>
 #include <time.h>
 #include <sys/time.h>
-
-#ifdef __APPLE__
-#include <fcntl.h>
-#include <sys/stat.h>
-#endif
 
 #ifndef NUM_PHILOSOPHERS
 #define NUM_PHILOSOPHERS 5
@@ -38,12 +30,43 @@ state_t;
 
 // information for each philosopher thread
 typedef struct {
-    int id; // 0..N-1
-    int left_fork; // fork index (same as id)
-    int right_fork; // (id+1)%N
-    int cycles; // remaining eat/think cycles
+    int id;          // 0..N-1
+    int left_fork;   // fork index (same as id)
+    int right_fork;  // (id+1)%N
+    int cycles;      // remaining eat/think cycles
 }
 phil_arg_t;
+
+// ---- unnamed POSIX semaphores for forks (Linux/CSL) ----
+static sem_t forks_unnamed[NUM_PHILOSOPHERS];
+
+static void forks_init_all(void) {
+    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
+        if (sem_init(&forks_unnamed[i], 0, 1) == -1) {
+            perror("sem_init");
+            exit(1);
+        }
+    }
+}
+
+static void forks_destroy_all(void) {
+    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
+        if (sem_destroy(&forks_unnamed[i]) == -1) {
+            perror("sem_destroy");
+        }
+    }
+}
+
+static void fork_wait_idx(int idx) {
+    while (sem_wait(&forks_unnamed[idx]) == -1 && errno == EINTR) {}
+}
+
+static void fork_post_idx(int idx) {
+    if (sem_post(&forks_unnamed[idx]) == -1) {
+        perror("sem_post");
+        exit(1);
+    }
+}
 
 // global variables
 static pthread_t tids[NUM_PHILOSOPHERS];
@@ -67,11 +90,7 @@ static void die_errno(const char *msg, int err) {
 static void dawdle(void) {
     // sleep for 0..DAWDLEFACTOR ms
     struct timespec tv;
-#ifdef __APPLE__
-    long ms = (long) (arc4random_uniform(DAWDLEFACTOR + 1));
-#else
     long ms = random() % (DAWDLEFACTOR + 1);
-#endif
     tv.tv_sec = ms / 1000;
     tv.tv_nsec = (ms % 1000) * 1000000L;
     if (nanosleep(&tv, NULL) == -1) {
@@ -280,9 +299,7 @@ int main(int argc, char **argv) {
         perror("gettimeofday");
         return 1;
     }
-#ifndef __APPLE__
     srandom((unsigned)(tv.tv_sec ^ tv.tv_usec));
-#endif
 
     // parse optional cycles argument
     long cycles = 1;
