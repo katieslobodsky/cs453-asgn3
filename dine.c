@@ -170,6 +170,14 @@ static void print_header(void) {
         printf("=============|");
     }
     printf("\n");
+
+    char fbuf[NUM_PHILOSOPHERS + 1];
+    printf("| ");
+    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
+        build_fork_str(i, fbuf, sizeof fbuf);
+        printf("%-5s%-7s| ", fbuf, "");
+    }
+    printf("\n");
     pthread_mutex_unlock(&print_mtx);
 }
 
